@@ -177,3 +177,17 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       && tar -C /opt/rbs/toolchain/ -xJf bcc-2.0.7-gcc-linux64.tar.xz \
       && rm bcc-2.0.7-gcc-linux64.tar.xz; \
 fi
+
+# Espressif GCC cross-toolchains (Xtensa + RISC-V) for the ESP PatchMaker components.
+# Released by espressif/crosstool-NG; each tarball extracts to xtensa-esp-elf/ or riscv32-esp-elf/,
+# matching the paths in the *_platform_toolchain.conf files.
+ARG ESP_TOOLCHAIN_RELEASE=esp-13.2.0_20230928
+ARG ESP_TOOLCHAIN_VERSION=13.2.0_20230928
+RUN if [ "$TARGETARCH" = "amd64" ]; then ESP_HOST=x86_64-linux-gnu; \
+    elif [ "$TARGETARCH" = "arm64" ]; then ESP_HOST=aarch64-linux-gnu; fi; \
+    cd /tmp && \
+    for tc in xtensa-esp-elf riscv32-esp-elf; do \
+      wget "https://github.com/espressif/crosstool-NG/releases/download/${ESP_TOOLCHAIN_RELEASE}/${tc}-${ESP_TOOLCHAIN_VERSION}-${ESP_HOST}.tar.xz" --show-progress --progress=bar:force:noscroll && \
+      tar xf "${tc}-${ESP_TOOLCHAIN_VERSION}-${ESP_HOST}.tar.xz" -C /opt/rbs/toolchain && \
+      rm -f "${tc}-${ESP_TOOLCHAIN_VERSION}-${ESP_HOST}.tar.xz"; \
+    done

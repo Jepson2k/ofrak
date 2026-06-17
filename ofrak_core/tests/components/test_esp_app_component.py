@@ -9,13 +9,26 @@ from typing import Optional
 import pytest
 
 from ofrak.component.unpacker import UnpackerError
+from ofrak.core.architecture import ProgramAttributes
 from ofrak.core.esp.app import _determine_chip, _parse_image
 from ofrak.core.program import CodeRegion
+from ofrak.core.patch_maker.modifiers import (
+    SegmentInjectorModifier,
+    SegmentInjectorModifierConfig,
+)
+from ofrak_patch_maker.toolchain.model import Segment
+from ofrak_type.architecture import InstructionSet
+from ofrak_type.bit_width import BitWidth
+from ofrak_type.endianness import Endianness
+from ofrak_type.memory_permissions import MemoryPermissions
 
 from ofrak import OFRAKContext
 from ofrak.resource import Resource
+from ofrak.component.modifier import ModifierError
 from ofrak.core.esp import (
     ESPApp,
+    ESPAppAddSegmentConfig,
+    ESPAppAddSegmentModifier,
     ESPAppAttributes,
     ESPAppFlashMode,
     ESPAppHeaderModifier,
@@ -433,6 +446,146 @@ async def test_identifier_ignores_short_resource(ofrak_context: OFRAKContext):
     assert not root_resource.has_tag(ESPApp)
 
 
+# ---------------------------------------------------------------------------
+# ProgramAttributes (ISA) derivation, used by PatchMaker
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "binary_path, expected_isa",
+    [
+        ("esp32_hello.bin", InstructionSet.XTENSA),  # ESP32
+        ("esp32s3_hello.bin", InstructionSet.XTENSA),  # ESP32-S3
+        ("esp32c3_hello.bin", InstructionSet.RISCV),  # ESP32-C3
+    ],
+    ids=["esp32", "esp32s3", "esp32c3"],
+)
+async def test_esp_app_program_attributes(
+    ofrak_context: OFRAKContext, binary_path: str, expected_isa: InstructionSet
+):
+    """The analyzer derives the ISA from the chip id (Xtensa for ESP32/S2/S3, RISC-V for C/H/P)."""
+    root_resource = await ofrak_context.create_root_resource(
+        binary_path, load_esp_asset(binary_path)
+    )
+    await root_resource.identify()
+    assert root_resource.has_tag(ESPApp)
+    attributes = await root_resource.analyze(ProgramAttributes)
+    assert attributes.isa == expected_isa
+    assert attributes.bit_width == BitWidth.BIT_32
+    assert attributes.endianness == Endianness.LITTLE_ENDIAN
+
+
+async def test_esp8266_program_attributes_is_xtensa(ofrak_context: OFRAKContext):
+    """A real ESP8266 image (no extended header) is detected as Xtensa."""
+    root_resource = await ofrak_context.create_root_resource(
+        "esp8266.bin", load_esp_asset("esp8266_hello.bin")
+    )
+    await root_resource.identify()
+    attributes = await root_resource.analyze(ProgramAttributes)
+    assert attributes.isa == InstructionSet.XTENSA
+    assert attributes.bit_width == BitWidth.BIT_32
+
+
+# ---------------------------------------------------------------------------
+# Adding injectable free space (the basis for PatchMaker code injection)
+# ---------------------------------------------------------------------------
+async def test_esp_app_add_segment(ofrak_context: OFRAKContext):
+    """
+    Appending a loadable segment grows the image by one valid segment: the segment count, the XOR
+    checksum, and the SHA256 digest are all recomputed so esptool still accepts the image. The
+    modifier runs on the identified image (before unpacking its segments), which is the order the
+    injection flow uses.
+    """
+    data = load_esp_asset("esp32_hello.bin")
+
+    # Count the original segments via a separate unpack so the assertion isn't hard-coded.
+    original = await ofrak_context.create_root_resource("orig.bin", data)
+    await original.identify()
+    await original.unpack()
+    segments_before = len(list(await (await original.view_as(ESPApp)).get_sections()))
+
+    new_vaddr = 0x40090000
+    new_size = 64
+    root_resource = await ofrak_context.create_root_resource("add_seg.bin", data)
+    await root_resource.identify()
+    assert root_resource.has_tag(ESPApp)
+    await root_resource.run(
+        ESPAppAddSegmentModifier,
+        ESPAppAddSegmentConfig(virtual_address=new_vaddr, size=new_size),
+    )
+    modified_data = await root_resource.get_data()
+    assert len(modified_data) > len(data)
+
+    # Re-unpack the modified image from scratch to confirm the new segment is real and valid.
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", modified_data)
+    await reloaded.identify()
+    assert reloaded.has_tag(ESPApp)
+    await reloaded.unpack()
+
+    sections = list(await (await reloaded.view_as(ESPApp)).get_sections())
+    assert len(sections) == segments_before + 1
+    assert any(s.virtual_address == new_vaddr and s.size == new_size for s in sections)
+
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.num_segments == segments_before + 1
+    assert attributes.checksum_valid is True
+    assert attributes.hash_valid is True
+
+    _verify_with_esptool(modified_data, has_hash=True)
+
+
+async def test_esp_app_inject_into_added_segment(ofrak_context: OFRAKContext):
+    """
+    Injecting bytes into a segment added by `ESPAppAddSegmentModifier` exercises the OFRAK
+    injection path end to end *minus compilation*: `SegmentInjectorModifier` locates the new
+    `ESPAppSection` `MemoryRegion` at its load address and patches it, and `ESPAppPacker`
+    re-validates the image (checksum + SHA256). This is exactly the mechanism
+    `PatchFromSourceModifier` drives once a toolchain has compiled the patch into bytes — so it can
+    be proven without a cross-compiler installed.
+    """
+    data = load_esp_asset("esp32_hello.bin")
+    new_vaddr = 0x40090000
+    # A recognizable, non-trivial payload that fills the whole segment.
+    payload = bytes((i * 7 + 1) & 0xFF for i in range(64))
+
+    # Add a segment to hold the payload, then unpack so its `ESPAppSection` child exists.
+    root = await ofrak_context.create_root_resource("inject.bin", data)
+    await root.identify()
+    await root.run(
+        ESPAppAddSegmentModifier,
+        ESPAppAddSegmentConfig(virtual_address=new_vaddr, size=len(payload)),
+    )
+    await root.unpack()
+
+    # Inject the payload into the new segment at its load address, then re-validate the image.
+    segment = Segment(
+        segment_name=".text",
+        vm_address=new_vaddr,
+        offset=0,
+        is_entry=False,
+        length=len(payload),
+        access_perms=MemoryPermissions.RX,
+    )
+    await root.run(
+        SegmentInjectorModifier,
+        SegmentInjectorModifierConfig(((segment, payload),)),
+    )
+    await root.run(ESPAppPacker)
+    patched_data = await root.get_data()
+
+    # Reload from scratch: the payload landed in the segment and the image is still esptool-valid.
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", patched_data)
+    await reloaded.identify()
+    await reloaded.unpack()
+    sections = list(await (await reloaded.view_as(ESPApp)).get_sections())
+    injected = [s for s in sections if s.virtual_address == new_vaddr]
+    assert len(injected) == 1
+    assert await injected[0].resource.get_data() == payload
+
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.checksum_valid is True
+    assert attributes.hash_valid is True
+    _verify_with_esptool(patched_data, has_hash=True)
+
+
 async def test_esp_app_header_modifier_flash_fields(ofrak_context: OFRAKContext):
     """ESPAppHeaderModifier rewrites flash mode/size/frequency in place (packer revalidates)."""
     root = await ofrak_context.create_root_resource("hdr.bin", load_esp_asset("esp32_hello.bin"))
@@ -451,6 +604,49 @@ async def test_esp_app_header_modifier_flash_fields(ofrak_context: OFRAKContext)
     assert attributes.flash_size == 0x20
     assert attributes.flash_frequency == 0x0F
     assert attributes.checksum_valid is True
+
+
+async def test_esp_app_add_segment_v2(ofrak_context: OFRAKContext):
+    """Adding a segment to an ESP8266 v2 image recomputes the XOR checksum and the CRC32 footer."""
+    data = load_esp_asset("esp8266v2_hello.bin")
+    new_vaddr = 0x40104000  # free ESP8266 IRAM address
+
+    original = await ofrak_context.create_root_resource("v2_orig.bin", data)
+    await original.identify()
+    await original.unpack()
+    segments_before = len(list(await (await original.view_as(ESPApp)).get_sections()))
+
+    root = await ofrak_context.create_root_resource("v2_add.bin", data)
+    await root.identify()
+    await root.run(
+        ESPAppAddSegmentModifier,
+        ESPAppAddSegmentConfig(virtual_address=new_vaddr, size=0x40),
+    )
+    patched = await root.get_data()
+
+    reloaded = await ofrak_context.create_root_resource("v2_reloaded.bin", patched)
+    await reloaded.identify()
+    await reloaded.unpack()
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.image_version == 2
+    assert attributes.num_segments == segments_before + 1
+    assert attributes.checksum_valid is True
+    assert attributes.crc32_valid is True
+
+
+async def test_esp_app_add_segment_rejects_trailing_data(ofrak_context: OFRAKContext):
+    """Adding a segment is refused if the image carries data past its footer (would be dropped)."""
+    # ESP8266 v1 has no appended hash/CRC, so its footer ends right after the checksum byte
+    # (exercises the no-hash/no-CRC ``image_end`` branch).
+    data = load_esp_asset("esp8266_hello.bin") + b"\xff" * 16  # trailing bytes past the footer
+    root = await ofrak_context.create_root_resource("trailing.bin", data)
+    await root.identify()
+    assert root.has_tag(ESPApp)
+    with pytest.raises(ModifierError):
+        await root.run(
+            ESPAppAddSegmentModifier,
+            ESPAppAddSegmentConfig(virtual_address=0x40090000, size=0x40),
+        )
 
 
 async def test_esp_app_get_section_by_name(ofrak_context: OFRAKContext):

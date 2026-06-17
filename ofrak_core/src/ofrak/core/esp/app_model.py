@@ -338,3 +338,20 @@ class ESPAppHeaderModifierConfig(ComponentConfig):
     flash_size: Optional[int] = None
     flash_frequency: Optional[int] = None
     entry_point: Optional[int] = None
+
+
+@dataclass
+class ESPAppAddSegmentConfig(ComponentConfig):
+    """
+    Configuration for appending a new loadable segment to an ESP app image. This is the mechanism
+    for creating injectable free space (ESP images are otherwise tightly packed) before running
+    PatchMaker against an `ESPApp`.
+
+    :param virtual_address: the load address of the new segment
+    :param size: the size in bytes of the new segment
+    :param fill_byte: the byte value the new segment is initialized with
+    """
+
+    virtual_address: int
+    size: int
+    fill_byte: int = 0x00

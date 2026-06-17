@@ -15,6 +15,7 @@ from ofrak_patch_maker.toolchain.model import (
 )
 from ofrak_patch_maker.toolchain.utils import get_file_format
 from .toolchain_under_test import ToolchainUnderTest
+from ofrak_type.endianness import Endianness
 from ofrak_type.memory_permissions import MemoryPermissions
 
 
@@ -296,3 +297,90 @@ def run_monkey_patch_test(toolchain_under_test: ToolchainUnderTest):
 
     assert os.path.exists(exec_path)
     assert get_file_format(exec_path) == tc_config.file_format
+
+
+def run_alignment_test(
+    toolchain_under_test: ToolchainUnderTest,
+    patch_source: str,
+    vm_address: int,
+    expected_bytes: bytes,
+):
+    """
+    Assemble a single-instruction patch, place its ``.text`` at ``vm_address``, and assert that the
+    emitted bytes (and the linked ELF's data encoding) match exactly.
+
+    This pins both deterministic code generation and the toolchain's endianness. For the Espressif
+    ``xtensa-esp-elf`` toolchain in particular it proves the little-endian core overlay is in effect:
+    without ``$XTENSA_GNU_CONFIG`` the unified GCC falls back to a big-endian core and the bytes come
+    out reversed.
+    """
+    tc_config = ToolchainConfig(
+        file_format=BinFileType.ELF,
+        force_inlines=True,
+        relocatable=False,
+        no_std_lib=True,
+        no_jump_tables=True,
+        no_bss_section=True,
+        create_map_files=True,
+        compiler_optimization_level=CompilerOptimizationLevel.NONE,
+        debug_info=True,
+        check_overlap=False,
+    )
+
+    build_dir = tempfile.mkdtemp()
+    patch_maker = PatchMaker(
+        toolchain=toolchain_under_test.toolchain(toolchain_under_test.proc, tc_config),
+        build_dir=build_dir,
+    )
+    patch_bom = patch_maker.make_bom("patch", [patch_source], [], [])
+    patch_object = patch_bom.object_map[patch_source]
+
+    text_segment = Segment(
+        segment_name=".text",
+        vm_address=vm_address,
+        offset=0,
+        is_entry=False,
+        length=len(expected_bytes),
+        access_perms=MemoryPermissions.RX,
+    )
+    # The GNU assembler/LLVM emit 0-length .data/.bss sections that must still map to a region.
+    data_placeholder = Segment(
+        segment_name=".data",
+        vm_address=0xFACE,
+        offset=0,
+        is_entry=False,
+        length=0,
+        access_perms=MemoryPermissions.RW,
+    )
+    bss_placeholder = Segment(
+        segment_name=".bss",
+        vm_address=0xFEED,
+        offset=0,
+        is_entry=False,
+        length=0,
+        access_perms=MemoryPermissions.RW,
+        is_bss=True,
+    )
+    segment_dict = {patch_object.path: (text_segment, data_placeholder, bss_placeholder)}
+
+    exec_path = os.path.join(build_dir, "patch_exec")
+    p = PatchRegionConfig(patch_bom.name + "_patch", segment_dict)
+    fem = patch_maker.make_fem([(patch_bom, p)], exec_path)
+
+    assert os.path.exists(exec_path)
+    assert get_file_format(exec_path) == tc_config.file_format
+
+    code_segments = [s for s in fem.executable.segments if s.access_perms == MemoryPermissions.RX]
+    assert len(code_segments) == 1
+    assert code_segments[0].vm_address == vm_address
+    assert code_segments[0].length == len(expected_bytes)
+
+    with open(exec_path, "rb") as f:
+        dat = f.read()
+
+    # ELF e_ident[EI_DATA]: 1 = little-endian, 2 = big-endian.
+    expected_ei_data = 1 if toolchain_under_test.proc.endianness == Endianness.LITTLE_ENDIAN else 2
+    assert dat[5] == expected_ei_data
+
+    code_offset = code_segments[0].offset
+    assert dat[code_offset : code_offset + len(expected_bytes)] == expected_bytes

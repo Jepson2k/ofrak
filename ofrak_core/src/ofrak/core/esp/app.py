@@ -6,17 +6,22 @@ from typing import List, Optional, Tuple
 
 from ofrak.component.analyzer import Analyzer
 from ofrak.component.identifier import Identifier
-from ofrak.component.modifier import Modifier
+from ofrak.component.modifier import Modifier, ModifierError
 from ofrak.component.packer import Packer
 from ofrak.component.unpacker import Unpacker, UnpackerError
+from ofrak.core.architecture import ProgramAttributes
 from ofrak.core.binary import GenericBinary
 from ofrak.core.program import CodeRegion
 from ofrak.resource import Resource
+from ofrak_type.architecture import InstructionSet
+from ofrak_type.bit_width import BitWidth
+from ofrak_type.endianness import Endianness
 from ofrak_type.range import Range
 
 from ofrak.core.esp.flash_model import ESPFlashSection
 from ofrak.core.esp.app_model import (
     ESPApp,
+    ESPAppAddSegmentConfig,
     ESPAppAttributes,
     ESPAppHeaderModifierConfig,
     ESPAppSection,
@@ -141,6 +146,23 @@ def _determine_chip(data: bytes) -> ESPChip:
     if chip is ESPChip.UNKNOWN:
         return ESPChip.ESP8266
     return chip
+
+
+# ESP32-C* / H2 / P4 are RISC-V; ESP8266 and the original ESP32/S2/S3 are Xtensa.
+_RISCV_CHIPS = frozenset(
+    {
+        ESPChip.ESP32C2,
+        ESPChip.ESP32C3,
+        ESPChip.ESP32C6,
+        ESPChip.ESP32H2,
+        ESPChip.ESP32C5,
+        ESPChip.ESP32P4,
+    }
+)
+
+
+def _chip_isa(chip: ESPChip) -> InstructionSet:
+    return InstructionSet.RISCV if chip in _RISCV_CHIPS else InstructionSet.XTENSA
 
 
 def _segment_memory_types(virtual_address: int, chip: ESPChip) -> List[str]:
@@ -506,6 +528,29 @@ class ESPAppAnalyzer(Analyzer[None, ESPAppAttributes]):
         )
 
 
+class ESPAppProgramAttributesAnalyzer(Analyzer[None, ProgramAttributes]):
+    """
+    Derive the `ProgramAttributes` (ISA, bit width, endianness) of an ESP app from its chip type,
+    so downstream tooling (e.g. PatchMaker) knows how to target it. ESP8266 and the original
+    ESP32/S2/S3 are 32-bit little-endian Xtensa; the ESP32-C/H/P RISC-V parts are 32-bit
+    little-endian RISC-V.
+    """
+
+    targets = (ESPApp,)
+    outputs = (ProgramAttributes,)
+
+    async def analyze(self, resource: Resource, config=None) -> ProgramAttributes:
+        data = bytes(await resource.get_data())
+        parsed = _parse_image(data)
+        return ProgramAttributes(
+            isa=_chip_isa(parsed.chip),
+            sub_isa=None,
+            bit_width=BitWidth.BIT_32,
+            endianness=Endianness.LITTLE_ENDIAN,
+            processor=None,
+        )
+
+
 ####################
 #    MODIFIERS     #
 ####################
@@ -535,6 +580,76 @@ class ESPAppHeaderModifier(Modifier[ESPAppHeaderModifierConfig]):
         if config.entry_point is not None:
             struct.pack_into("<I", header, 4, config.entry_point)
         resource.queue_patch(Range.from_size(base, ESP_APP_HEADER_SIZE), bytes(header))
+
+
+class ESPAppAddSegmentModifier(Modifier[ESPAppAddSegmentConfig]):
+    """
+    Append a new loadable segment (filled with `fill_byte`) to an ESP app image, recomputing the
+    segment count and the trailing checksum / SHA256 / CRC32 so the image stays valid.
+
+    ESP app images are tightly packed, so this is how injectable free space is created before
+    running PatchMaker. Because adding a segment resizes the image, run this modifier on the
+    identified `ESPApp` *before* unpacking its segments (otherwise the existing `ESPAppSection`
+    children overlap the resize). A typical code-injection flow is: identify the `ESPApp`, run this
+    modifier to add a segment at a free load address, unpack so the new `ESPAppSection` appears, tag
+    it `FreeSpace` and the `ESPApp` `Allocatable`, then run `PatchFromSourceModifier` (which uses the
+    `ProgramAttributes` from `ESPAppProgramAttributesAnalyzer` to pick the Xtensa/RISC-V toolchain)
+    and finally `ESPAppPacker`.
+    """
+
+    id = b"ESPAppAddSegmentModifier"
+    targets = (ESPApp,)
+
+    async def modify(self, resource: Resource, config: ESPAppAddSegmentConfig) -> None:
+        data = bytes(await resource.get_data())
+        parsed = _parse_image(data)
+
+        # Defensive guards against malformed images that real ESP toolchains never emit (0 segments,
+        # or a segment count already at the 1-byte max); excluded from coverage accordingly.
+        if not parsed.segments:  # pragma: no cover
+            raise ModifierError("Cannot add a segment to an ESP image that has no segments")
+        if data[parsed.primary_header_offset + 1] >= 0xFF:  # pragma: no cover
+            raise ModifierError(
+                "Cannot add a segment: the image already has the maximum of 255 segments"
+            )
+
+        # The modifier rebuilds the footer, so it only preserves bytes up to the last segment.
+        # Refuse rather than silently drop anything that lies past the footer (e.g. flash padding).
+        if parsed.hash_appended and parsed.hash_offset is not None:
+            image_end = parsed.hash_offset + 32
+        elif parsed.crc_offset is not None:
+            image_end = parsed.crc_offset + 4
+        else:
+            image_end = parsed.checksum_offset + 1
+        if len(data) > image_end:
+            raise ModifierError(
+                f"ESP image has {len(data) - image_end} byte(s) of trailing data after the footer; "
+                "refusing to add a segment because they would be dropped"
+            )
+
+        last_segment = parsed.segments[-1]
+        end_of_segments = last_segment.data_offset + last_segment.size
+        segment_data = bytes([config.fill_byte & 0xFF]) * config.size
+        new_segment = struct.pack("<II", config.virtual_address, config.size) + segment_data
+
+        # Rebuild: header(s) + existing segments + the new segment, with the segment count bumped.
+        body = bytearray(data[:end_of_segments]) + new_segment
+        body[parsed.primary_header_offset + 1] += 1
+
+        # Recompute the checksum over the existing checksummed segments plus the new one.
+        checksum = _calculate_checksum(data, parsed)
+        for byte in segment_data:
+            checksum ^= byte
+        checksum &= 0xFF
+
+        checksum_offset = _checksum_offset(len(body))
+        image = bytearray(body) + bytes(checksum_offset - len(body)) + bytes([checksum])
+        if parsed.hash_appended:
+            image += hashlib.sha256(bytes(image)).digest()
+        elif parsed.crc_offset is not None:
+            image += struct.pack("<I", _esp8266_crc32(bytes(image)))
+
+        resource.queue_patch(Range(0, len(data)), bytes(image))
 
 
 ####################

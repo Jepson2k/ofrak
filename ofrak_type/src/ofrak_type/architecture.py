@@ -20,6 +20,8 @@ class InstructionSet(Enum):
     :ivar M68K: Motorola 68K
     :ivar AVR: Atmel AVR
     :ivar SPARC: SPARC
+    :ivar XTENSA: Tensilica Xtensa (e.g. ESP32, ESP32-S2/S3, ESP8266)
+    :ivar RISCV: RISC-V (e.g. ESP32-C2/C3/C6, ESP32-H2)
     """
 
     ARM = "arm"
@@ -31,6 +33,8 @@ class InstructionSet(Enum):
     M68K = "68000"
     AVR = "avr"
     SPARC = "sparc"
+    XTENSA = "xtensa"
+    RISCV = "riscv"
 
 
 class SubInstructionSet(Enum):

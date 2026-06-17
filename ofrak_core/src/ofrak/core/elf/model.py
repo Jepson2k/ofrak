@@ -153,6 +153,7 @@ class ElfMachine(Enum):
     EM_ST200 = 100  # STMicroelectronics (www.st.com) ST200 microcontroller
     EM_MAXQ30 = 169  # Dallas Semiconductor MAXQ30 Core Micro-controllers
     EM_AARCH64 = 183  # 64-bit Advanced RISC Machines ARM
+    EM_RISCV = 243  # RISC-V
 
     @staticmethod
     def get_isa(e_machine: int) -> InstructionSet:
@@ -173,6 +174,8 @@ class ElfMachine(Enum):
             # /AN4465-dev-tools-guide.pdf), in practice PPC is quite similar.
             ElfMachine.EM_MAXQ30.value: InstructionSet.PPC,
             ElfMachine.EM_SPARC.value: InstructionSet.SPARC,
+            ElfMachine.EM_XTENSA.value: InstructionSet.XTENSA,
+            ElfMachine.EM_RISCV.value: InstructionSet.RISCV,
         }
 
         if e_machine not in MACHINE_TO_ISA:
