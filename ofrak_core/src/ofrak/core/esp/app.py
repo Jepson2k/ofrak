@@ -1,5 +1,7 @@
 import binascii
+import functools
 import hashlib
+import operator
 import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -22,6 +24,7 @@ from ofrak.core.esp.flash_model import ESPFlashSection
 from ofrak.core.esp.app_model import (
     ESPApp,
     ESPAppAddSegmentConfig,
+    ESPAppExtendSegmentConfig,
     ESPAppAttributes,
     ESPAppHeaderModifierConfig,
     ESPAppSection,
@@ -178,6 +181,20 @@ def _is_instruction_region(name: str) -> bool:
 def _is_data_region(name: str) -> bool:
     """Whether a memory-map region name denotes data memory (DRAM / DROM / RTC_DATA / ...)."""
     return "DRAM" in name or "DROM" in name or "DATA" in name or "DPORT" in name
+
+
+def _is_flash_mapped_region(name: str) -> bool:
+    """
+    Whether a region name denotes flash-cache-mapped memory (IROM / DROM). The bootloader maps these
+    segments through the flash MMU rather than copying them to RAM, which requires the segment's data
+    to be 64 KB-aligned with its load address (see :class:`ESPAppAddSegmentModifier`).
+    """
+    return "IROM" in name or "DROM" in name
+
+
+# The flash MMU maps in 64 KB pages, so a memory-mapped (IROM/DROM) segment's flash offset must be
+# congruent to its load address modulo this value or the bootloader rejects the image as unbootable.
+_FLASH_MMU_ALIGN = 0x10000
 
 
 def _classify_segment(
@@ -369,9 +386,79 @@ def _calculate_checksum(data: bytes, parsed: _ParsedImage) -> int:
     checksum = ESP_APP_CHECKSUM_MAGIC
     for segment in parsed.segments:
         if segment.in_checksum:
-            for byte in data[segment.data_offset : segment.data_offset + segment.size]:
-                checksum ^= byte
+            checksum = functools.reduce(
+                operator.xor,
+                data[segment.data_offset : segment.data_offset + segment.size],
+                checksum,
+            )
     return checksum & 0xFF
+
+
+def _image_end_offset(parsed: _ParsedImage) -> int:
+    """File offset one byte past the image footer (the checksum byte, or the appended SHA256/CRC32)."""
+    if parsed.hash_appended and parsed.hash_offset is not None:
+        return parsed.hash_offset + 32
+    if parsed.crc_offset is not None:
+        return parsed.crc_offset + 4
+    return parsed.checksum_offset + 1
+
+
+def _footer_bytes(core: bytes, parsed: _ParsedImage) -> bytes:
+    """
+    The footer that follows the checksum byte: the v1 SHA256 digest (32 bytes), the ESP8266-v2 CRC32
+    (4 bytes), or nothing (ESP8266 v1). ``core`` is the image from its start up to and including the
+    checksum byte -- exactly the bytes the digest / CRC32 is computed over. Shared by
+    `_image_with_footer` (which appends it to a fresh, length-changing image) and `ESPAppPacker`
+    (which rewrites it in place to preserve any trailing flash padding).
+    """
+    if parsed.hash_appended:
+        return hashlib.sha256(core).digest()
+    if parsed.crc_offset is not None:
+        return struct.pack("<I", _esp8266_crc32(core))
+    return b""
+
+
+def _image_with_footer(body: bytes, checksum: int, parsed: _ParsedImage) -> bytes:
+    """Append the 16-byte-aligned checksum byte and the format's SHA256 / CRC32 footer to ``body``
+    (the segment bytes), returning the complete image. Mirrors the in-place footer recompute in
+    `ESPAppPacker`, but builds a fresh image for modifiers that change the image length."""
+    checksum_offset = _checksum_offset(len(body))
+    core = bytes(body) + bytes(checksum_offset - len(body)) + bytes([checksum & 0xFF])
+    return core + _footer_bytes(core, parsed)
+
+
+def _rebuild_image(data: bytes, parsed: _ParsedImage, body: bytes, checksum: int) -> bytes:
+    """
+    Assemble the patched image from rebuilt segment `body` and recomputed `checksum`.
+
+    A standalone image (nothing past the footer) simply grows. An image padded to a fixed-size region
+    -- e.g. an `ESPApp` carved from a flash dump, which fills its partition slot -- keeps its total
+    length: the new bytes consume the trailing padding, so the patched app still fits the slot and the
+    surrounding flash layout is unchanged. The appended SHA256/CRC32 stays valid because it sits at its
+    offset inside the rebuilt core, computed over the bytes before it; any padding after it is outside
+    the declared image (exactly as in the original). Raise if the growth exceeds the padding.
+    """
+    new_core = _image_with_footer(body, checksum, parsed)
+    image_end = _image_end_offset(parsed)
+    trailing = len(data) - image_end
+    if trailing <= 0:
+        return new_core
+    if len(new_core) > len(data):
+        raise ModifierError(
+            f"patched ESP image is {len(new_core)} bytes but only {len(data)} are available "
+            f"(the original image plus its {trailing} trailing padding byte(s)); the injected "
+            f"segment does not fit the available space"
+        )
+    # Both callers only grow the image, so the rebuilt core reaches at least the original image end
+    # and the preserved tail is pure trailing padding. Guard that invariant with a raise (not a
+    # strippable assert): a shrinking caller would otherwise splice stale original footer/segment
+    # bytes after the freshly written footer.
+    if len(new_core) < image_end:
+        raise ModifierError(
+            "_rebuild_image only supports growth; a shorter core would preserve stale image bytes "
+            "instead of trailing padding"
+        )
+    return new_core + data[len(new_core) :]
 
 
 ####################
@@ -613,18 +700,16 @@ class ESPAppAddSegmentModifier(Modifier[ESPAppAddSegmentConfig]):
                 "Cannot add a segment: the image already has the maximum of 255 segments"
             )
 
-        # The modifier rebuilds the footer, so it only preserves bytes up to the last segment.
-        # Refuse rather than silently drop anything that lies past the footer (e.g. flash padding).
-        if parsed.hash_appended and parsed.hash_offset is not None:
-            image_end = parsed.hash_offset + 32
-        elif parsed.crc_offset is not None:
-            image_end = parsed.crc_offset + 4
-        else:
-            image_end = parsed.checksum_offset + 1
-        if len(data) > image_end:
+        # A new flash-mapped (IROM/DROM) segment cannot be added: the bootloader maps only one segment
+        # per such region, so it would refuse to map a second. Grow the existing one instead.
+        if any(
+            _is_flash_mapped_region(name)
+            for name in _segment_memory_types(config.virtual_address, parsed.chip)
+        ):
             raise ModifierError(
-                f"ESP image has {len(data) - image_end} byte(s) of trailing data after the footer; "
-                "refusing to add a segment because they would be dropped"
+                f"0x{config.virtual_address:x} is in a flash-mapped (IROM/DROM) region; the ESP "
+                f"bootloader maps only one segment per such region. Use "
+                f"ESPAppExtendSegmentModifier to grow the existing mapped segment instead."
             )
 
         last_segment = parsed.segments[-1]
@@ -636,20 +721,91 @@ class ESPAppAddSegmentModifier(Modifier[ESPAppAddSegmentConfig]):
         body = bytearray(data[:end_of_segments]) + new_segment
         body[parsed.primary_header_offset + 1] += 1
 
-        # Recompute the checksum over the existing checksummed segments plus the new one.
+        # Recompute the checksum over the existing checksummed segments plus the new one. The new
+        # segment is a single repeated fill byte, so XORing it in depends only on the parity of the
+        # count (an even count cancels out).
         checksum = _calculate_checksum(data, parsed)
-        for byte in segment_data:
-            checksum ^= byte
-        checksum &= 0xFF
+        if config.size & 1:
+            checksum ^= config.fill_byte & 0xFF
 
-        checksum_offset = _checksum_offset(len(body))
-        image = bytearray(body) + bytes(checksum_offset - len(body)) + bytes([checksum])
-        if parsed.hash_appended:
-            image += hashlib.sha256(bytes(image)).digest()
-        elif parsed.crc_offset is not None:
-            image += struct.pack("<I", _esp8266_crc32(bytes(image)))
+        resource.queue_patch(
+            Range(0, len(data)), _rebuild_image(data, parsed, bytes(body), checksum)
+        )
 
-        resource.queue_patch(Range(0, len(data)), bytes(image))
+
+class ESPAppExtendSegmentModifier(Modifier[ESPAppExtendSegmentConfig]):
+    """
+    Grow an existing loadable segment in place by appending `fill_byte` bytes to its end, recomputing
+    the trailing checksum / SHA256 / CRC32 so the image stays valid.
+
+    This is the counterpart to `ESPAppAddSegmentModifier` for flash-memory-mapped (IROM / DROM)
+    regions: the bootloader maps only one segment per such region, so injected code must extend the
+    existing mapped segment rather than be added as a new one (which the bootloader would refuse to
+    map). The new free space is contiguous with the segment at `segment_virtual_address + <old size>`.
+    Run on the identified `ESPApp` before unpacking, then unpack, run PatchMaker against the new free
+    space, and finally `ESPAppPacker` -- the same flow as `ESPAppAddSegmentModifier`.
+    """
+
+    id = b"ESPAppExtendSegmentModifier"
+    targets = (ESPApp,)
+
+    async def modify(self, resource: Resource, config: ESPAppExtendSegmentConfig) -> None:
+        data = bytes(await resource.get_data())
+        parsed = _parse_image(data)
+
+        index = next(
+            (
+                i
+                for i, segment in enumerate(parsed.segments)
+                if segment.virtual_address == config.segment_virtual_address
+            ),
+            None,
+        )
+        if index is None:
+            raise ModifierError(
+                f"No segment with load address 0x{config.segment_virtual_address:x} to extend"
+            )
+
+        segment = parsed.segments[index]
+        # Appending shifts every later segment in the file. A later *mapped* (IROM/DROM) segment must
+        # keep `data_offset % 64KB == vaddr % 64KB`, so round the growth up to a 64KB multiple when
+        # one exists; load segments (and the common case where the mapped segment is last) need none.
+        chip = parsed.chip
+        later_mapped = any(
+            _is_flash_mapped_region(name)
+            for later in parsed.segments[index + 1 :]
+            for name in _segment_memory_types(later.virtual_address, chip)
+        )
+        grow = config.size
+        if later_mapped and grow % _FLASH_MMU_ALIGN != 0:
+            grow += _FLASH_MMU_ALIGN - (grow % _FLASH_MMU_ALIGN)
+        fill = bytes([config.fill_byte & 0xFF]) * grow
+
+        end_of_segments = parsed.segments[-1].data_offset + parsed.segments[-1].size
+        segment_data_end = segment.data_offset + segment.size
+        body = bytearray(data[:end_of_segments])
+        # Insert the fill at the end of this segment's data. The grown segment's start (and thus its
+        # own `data_offset % 64KB == vaddr % 64KB` flash-MMU congruence) is unchanged; only segments
+        # that follow it shift, which is why the alignment rounding above targets a *later* mapped
+        # segment, not this one.
+        body[segment_data_end:segment_data_end] = fill
+        # Bump the grown segment's size field (the second uint32 of its 8-byte header). The insertion
+        # is at `segment_data_end`, after this header, so `segment.data_offset` (and the header offset
+        # derived from it) is still valid in `body`.
+        header_offset = segment.data_offset - ESP_APP_SEGMENT_HEADER_SIZE
+        struct.pack_into("<I", body, header_offset + 4, segment.size + grow)
+
+        # Recompute the checksum over the existing checksummed segments plus the appended fill -- but
+        # only if this segment participates in the checksum (the ESP8266-v2 irom0 segment does not).
+        # The fill is a single repeated byte, so its contribution depends only on the parity of the
+        # count (an even count cancels out).
+        checksum = _calculate_checksum(data, parsed)
+        if segment.in_checksum and grow & 1:
+            checksum ^= config.fill_byte & 0xFF
+
+        resource.queue_patch(
+            Range(0, len(data)), _rebuild_image(data, parsed, bytes(body), checksum)
+        )
 
 
 ####################
@@ -668,22 +824,18 @@ class ESPAppPacker(Packer[None]):
     targets = (ESPApp,)
 
     async def pack(self, resource: Resource, config=None) -> None:
+        # In-place counterpart to `_image_with_footer`: recompute the footer fields where they
+        # already sit instead of rebuilding the image, so any bytes past the footer (e.g. flash
+        # padding) are preserved rather than dropped.
         data = bytearray(await resource.get_data())
         parsed = _parse_image(bytes(data))
 
         data[parsed.checksum_offset] = _calculate_checksum(bytes(data), parsed)
 
-        if parsed.hash_appended and parsed.hash_offset is not None:
-            data[parsed.hash_offset : parsed.hash_offset + 32] = hashlib.sha256(
-                bytes(data[: parsed.hash_offset])
-            ).digest()
-
-        if parsed.crc_offset is not None:
-            struct.pack_into(
-                "<I",
-                data,
-                parsed.crc_offset,
-                _esp8266_crc32(bytes(data[: parsed.crc_offset])),
-            )
+        # The SHA256 / CRC32 (if any) is computed over everything up to and including the checksum
+        # byte and written right after it -- the same core/footer split as `_image_with_footer`,
+        # but in place so any trailing flash padding is preserved.
+        footer = _footer_bytes(bytes(data[: parsed.checksum_offset + 1]), parsed)
+        data[parsed.checksum_offset + 1 : parsed.checksum_offset + 1 + len(footer)] = footer
 
         resource.queue_patch(Range.from_size(0, len(data)), bytes(data))

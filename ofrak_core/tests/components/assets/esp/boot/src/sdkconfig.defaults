@@ -1,0 +1,15 @@
+# Boot on the oldest chip revision so the image runs under Espressif QEMU's emulated parts
+# (which report chip rev v0.0 with a blank efuse). The per-chip symbol for the inactive target
+# is simply ignored by the active build.
+CONFIG_ESP32_REV_MIN_0=y
+CONFIG_ESP32C3_REV_MIN_0=y
+
+# Keep the app as small as possible so OFRAK can disassemble the entire IROM code region quickly:
+# optimize for size, drop all logging, and use the compact newlib formatting. The app prints via
+# esp_rom_printf (direct ROM UART) rather than stdout, so it does not pull in the newlib/VFS
+# console stack.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+CONFIG_NEWLIB_NANO_FORMAT=y

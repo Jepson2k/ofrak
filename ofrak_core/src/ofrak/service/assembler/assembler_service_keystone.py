@@ -22,6 +22,10 @@ except ImportError:
     KEYSTONE_INSTALL_WORKS = False
 
 from ofrak.core.architecture import ProgramAttributes
+from ofrak.service.assembler.assembler_service_i import (
+    AssemblerBackend,
+    AssemblerServiceInterface,
+)
 from ofrak_io.stream_capture import StreamCapture
 from ofrak_type.architecture import InstructionSet, InstructionSetMode, ProcessorType
 from ofrak_type.bit_width import BitWidth
@@ -39,10 +43,12 @@ X86_64_SPECIAL_CASES = {
 }
 
 
-class KeystoneAssemblerService:
+class KeystoneAssemblerService(AssemblerServiceInterface):
     """
     An assembler service implementation using the keystone engine.
     """
+
+    backend = AssemblerBackend.KEYSTONE
 
     def __init__(self):
         self._ks_by_processor = {}

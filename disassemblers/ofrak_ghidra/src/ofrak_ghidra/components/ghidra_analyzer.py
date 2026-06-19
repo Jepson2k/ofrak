@@ -331,6 +331,8 @@ class GhidraProjectAnalyzer(Analyzer[None, GhidraProject]):
             InstructionSet.PPC: "PowerPC",
             InstructionSet.M68K: "68000",
             InstructionSet.X86: "x86",
+            InstructionSet.RISCV: "RISCV",
+            InstructionSet.XTENSA: "Xtensa",
         }
         family = families.get(processor.isa)
 

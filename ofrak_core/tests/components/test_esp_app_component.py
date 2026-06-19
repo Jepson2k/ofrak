@@ -1,7 +1,3 @@
-import os
-import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -29,6 +25,8 @@ from ofrak.core.esp import (
     ESPApp,
     ESPAppAddSegmentConfig,
     ESPAppAddSegmentModifier,
+    ESPAppExtendSegmentConfig,
+    ESPAppExtendSegmentModifier,
     ESPAppAttributes,
     ESPAppFlashMode,
     ESPAppHeaderModifier,
@@ -40,6 +38,8 @@ from ofrak.core.esp import (
 )
 from pytest_ofrak.patterns.modify import ModifyPattern
 from pytest_ofrak.patterns.unpack_modify_pack import UnpackModifyPackPattern
+
+from .esp_image_info import verify_with_esptool
 
 
 def load_esp_asset(filename: str) -> bytes:
@@ -219,47 +219,6 @@ class TestESPAppHeaderModification(ModifyPattern):
         assert attributes.entry_point != self.original_entry_point
 
 
-def _verify_with_esptool(packed_data: bytes, has_hash: bool = True):
-    """Independently validate packed ESP app data with esptool's ``image_info`` (a pinned test dep)."""
-    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as temp_file:
-        temp_file.write(packed_data)
-        temp_file.flush()
-        temp_path = temp_file.name
-
-    try:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "esptool",
-                "image_info",
-                "--version",
-                "2",
-                temp_path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        assert result.returncode == 0, f"esptool failed: {result.stderr}"
-
-        output = result.stdout
-        assert "Checksum:" in output, "esptool output should contain checksum information"
-        assert "invalid" not in output.lower(), "Checksum should not be invalid"
-
-        if has_hash:
-            assert any(
-                word in output.lower() for word in ["hash", "digest", "sha256"]
-            ), "Output should contain hash information for ESP32 images"
-
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-
 class TestESP32AppUnpackModifyPack(UnpackModifyPackPattern):
     async def create_root_resource(self, ofrak_context: OFRAKContext) -> Resource:
         return await ofrak_context.create_root_resource(
@@ -291,7 +250,7 @@ class TestESP32AppUnpackModifyPack(UnpackModifyPackPattern):
         assert attributes.checksum_valid is True
         assert attributes.hash_valid is True
 
-        _verify_with_esptool(await repacked_root_resource.get_data(), has_hash=True)
+        verify_with_esptool(await repacked_root_resource.get_data(), has_hash=True)
 
 
 class TestESP8266AppUnpackModifyPack(UnpackModifyPackPattern):
@@ -324,7 +283,7 @@ class TestESP8266AppUnpackModifyPack(UnpackModifyPackPattern):
         assert attributes.entry_point == self.new_entry_point
         assert attributes.checksum_valid is True
 
-        _verify_with_esptool(await repacked_root_resource.get_data(), has_hash=False)
+        verify_with_esptool(await repacked_root_resource.get_data(), has_hash=False)
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +488,7 @@ async def test_esp_app_add_segment(ofrak_context: OFRAKContext):
     assert attributes.checksum_valid is True
     assert attributes.hash_valid is True
 
-    _verify_with_esptool(modified_data, has_hash=True)
+    verify_with_esptool(modified_data, has_hash=True)
 
 
 async def test_esp_app_inject_into_added_segment(ofrak_context: OFRAKContext):
@@ -583,7 +542,182 @@ async def test_esp_app_inject_into_added_segment(ofrak_context: OFRAKContext):
     attributes = await reloaded.analyze(ESPAppAttributes)
     assert attributes.checksum_valid is True
     assert attributes.hash_valid is True
-    _verify_with_esptool(patched_data, has_hash=True)
+    verify_with_esptool(patched_data, has_hash=True)
+
+
+async def test_esp_app_extend_segment(ofrak_context: OFRAKContext):
+    """
+    Extending a segment grows it in place by the requested size, leaving the segment count unchanged
+    and recomputing the checksum / SHA256 so esptool still accepts the image. This is how code is
+    injected into a flash-memory-mapped (IROM/DROM) region, where the bootloader maps only one
+    segment. The IROM code segment is followed only by load segments, so no alignment padding occurs.
+    """
+    data = load_esp_asset("esp32_hello.bin")
+    original = await ofrak_context.create_root_resource("orig.bin", data)
+    await original.identify()
+    await original.unpack()
+    sections_before = list(await (await original.view_as(ESPApp)).get_sections())
+    irom = next(s for s in sections_before if "IROM" in s.name)
+    grow = 64
+
+    root = await ofrak_context.create_root_resource("extend.bin", data)
+    await root.identify()
+    assert root.has_tag(ESPApp)
+    await root.run(
+        ESPAppExtendSegmentModifier,
+        ESPAppExtendSegmentConfig(segment_virtual_address=irom.virtual_address, size=grow),
+    )
+    modified = await root.get_data()
+    assert len(modified) > len(data)
+
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", modified)
+    await reloaded.identify()
+    await reloaded.unpack()
+    sections_after = list(await (await reloaded.view_as(ESPApp)).get_sections())
+    assert len(sections_after) == len(sections_before)  # extended in place, not added
+    extended = next(s for s in sections_after if s.virtual_address == irom.virtual_address)
+    assert extended.size == irom.size + grow
+
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.checksum_valid is True
+    assert attributes.hash_valid is True
+    verify_with_esptool(modified, has_hash=True)
+
+
+async def test_esp_app_extend_segment_aligns_following_mapped_segment(ofrak_context: OFRAKContext):
+    """
+    When a later segment is also flash-mapped, the growth is rounded up to a 64KB multiple so that
+    segment's MMU alignment (flash offset congruent to load address mod 64KB) is preserved and the
+    image stays bootable. Extending the first (DROM) segment -- which is followed by the mapped IROM
+    segment -- exercises that path.
+    """
+    data = load_esp_asset("esp32_hello.bin")
+    original = await ofrak_context.create_root_resource("orig.bin", data)
+    await original.identify()
+    await original.unpack()
+    drom = next(
+        s for s in await (await original.view_as(ESPApp)).get_sections() if "DROM" in s.name
+    )
+
+    root = await ofrak_context.create_root_resource("extend.bin", data)
+    await root.identify()
+    await root.run(
+        ESPAppExtendSegmentModifier,
+        ESPAppExtendSegmentConfig(segment_virtual_address=drom.virtual_address, size=1),
+    )
+    modified = await root.get_data()
+
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", modified)
+    await reloaded.identify()
+    await reloaded.unpack()
+    extended = next(
+        s
+        for s in await (await reloaded.view_as(ESPApp)).get_sections()
+        if s.virtual_address == drom.virtual_address
+    )
+    # size=1 was rounded up to a full 64KB page so the following IROM segment stays aligned.
+    assert extended.size == drom.size + 0x10000
+    verify_with_esptool(modified, has_hash=True)
+
+
+async def test_esp_app_extend_segment_missing_raises(ofrak_context: OFRAKContext):
+    """Extending a load address that matches no segment is a clean ModifierError."""
+    root = await ofrak_context.create_root_resource("extend.bin", load_esp_asset("esp32_hello.bin"))
+    await root.identify()
+    with pytest.raises(ModifierError):
+        await root.run(
+            ESPAppExtendSegmentModifier,
+            ESPAppExtendSegmentConfig(segment_virtual_address=0x1, size=16),
+        )
+
+
+async def test_esp_app_extend_segment_preserves_trailing_data(ofrak_context: OFRAKContext):
+    """An `ESPApp` carved from a flash dump fills its partition slot, so it carries padding past the
+    footer. Extending a segment consumes that padding -- keeping the image the same total length so it
+    still fits the slot -- rather than dropping it or refusing."""
+    probe = await ofrak_context.create_root_resource("probe.bin", load_esp_asset("esp32_hello.bin"))
+    await probe.identify()
+    await probe.unpack()
+    irom = next(s for s in await (await probe.view_as(ESPApp)).get_sections() if "IROM" in s.name)
+
+    padded = load_esp_asset("esp32_hello.bin") + b"\xff" * 0x100  # simulate partition-slot padding
+    root = await ofrak_context.create_root_resource("extend.bin", padded)
+    await root.identify()
+    await root.run(
+        ESPAppExtendSegmentModifier,
+        ESPAppExtendSegmentConfig(segment_virtual_address=irom.virtual_address, size=64),
+    )
+    modified = await root.get_data()
+    assert len(modified) == len(padded)  # padding absorbed the growth; total length unchanged
+    # Surviving partition padding past the rebuilt footer is preserved verbatim (not zeroed or
+    # mis-spliced); the 0x80-byte tail is well within the padding left after the 64-byte growth.
+    assert modified[-0x80:] == b"\xff" * 0x80
+
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", modified)
+    await reloaded.identify()
+    await reloaded.unpack()
+    extended = next(
+        s
+        for s in await (await reloaded.view_as(ESPApp)).get_sections()
+        if s.virtual_address == irom.virtual_address
+    )
+    assert extended.size == irom.size + 64
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.checksum_valid is True
+    assert attributes.hash_valid is True
+
+
+async def test_esp_app_extend_segment_too_large_for_padding_raises(ofrak_context: OFRAKContext):
+    """When the growth exceeds the available trailing padding, the modifier raises rather than
+    overrun the partition slot."""
+    probe = await ofrak_context.create_root_resource("probe.bin", load_esp_asset("esp32_hello.bin"))
+    await probe.identify()
+    await probe.unpack()
+    irom = next(s for s in await (await probe.view_as(ESPApp)).get_sections() if "IROM" in s.name)
+
+    padded = load_esp_asset("esp32_hello.bin") + b"\xff" * 8  # only 8 bytes of slack
+    root = await ofrak_context.create_root_resource("extend.bin", padded)
+    await root.identify()
+    with pytest.raises(ModifierError):
+        await root.run(
+            ESPAppExtendSegmentModifier,
+            ESPAppExtendSegmentConfig(segment_virtual_address=irom.virtual_address, size=0x80),
+        )
+
+
+async def test_esp_app_extend_segment_v2_checksum(ofrak_context: OFRAKContext):
+    """Extending the ESP8266-v2 irom0 segment -- which is NOT covered by the XOR checksum -- must
+    still produce a valid checksum and CRC32: the fill bytes must not be folded into the checksum, and
+    the chip must come from the parsed image (re-deriving it misreads a v2 header as ESP32 and would
+    wrongly 64KB-align the growth)."""
+    data = load_esp_asset("esp8266v2_hello.bin")
+    probe = await ofrak_context.create_root_resource("v2_probe.bin", data)
+    await probe.identify()
+    await probe.unpack()
+    irom0 = next(
+        s for s in await (await probe.view_as(ESPApp)).get_sections() if s.section_index == 0
+    )
+
+    root = await ofrak_context.create_root_resource("v2_extend.bin", data)
+    await root.identify()
+    await root.run(
+        ESPAppExtendSegmentModifier,
+        ESPAppExtendSegmentConfig(segment_virtual_address=irom0.virtual_address, size=64),
+    )
+    modified = await root.get_data()
+
+    reloaded = await ofrak_context.create_root_resource("v2_reloaded.bin", modified)
+    await reloaded.identify()
+    await reloaded.unpack()
+    extended = next(
+        s
+        for s in await (await reloaded.view_as(ESPApp)).get_sections()
+        if s.virtual_address == irom0.virtual_address
+    )
+    assert extended.size == irom0.size + 64  # grown by exactly 64 (no spurious 64KB rounding)
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.checksum_valid is True
+    assert attributes.crc32_valid is True
 
 
 async def test_esp_app_header_modifier_flash_fields(ofrak_context: OFRAKContext):
@@ -634,18 +768,49 @@ async def test_esp_app_add_segment_v2(ofrak_context: OFRAKContext):
     assert attributes.crc32_valid is True
 
 
-async def test_esp_app_add_segment_rejects_trailing_data(ofrak_context: OFRAKContext):
-    """Adding a segment is refused if the image carries data past its footer (would be dropped)."""
-    # ESP8266 v1 has no appended hash/CRC, so its footer ends right after the checksum byte
-    # (exercises the no-hash/no-CRC ``image_end`` branch).
-    data = load_esp_asset("esp8266_hello.bin") + b"\xff" * 16  # trailing bytes past the footer
-    root = await ofrak_context.create_root_resource("trailing.bin", data)
+async def test_esp_app_add_segment_preserves_trailing_data(ofrak_context: OFRAKContext):
+    """Adding a load segment to an image padded to a fixed slot consumes the padding, keeping the
+    total length unchanged (so the patched app still fits the slot)."""
+    padded = load_esp_asset("esp32_hello.bin") + b"\xff" * 0x200
+    root = await ofrak_context.create_root_resource("add.bin", padded)
     await root.identify()
     assert root.has_tag(ESPApp)
-    with pytest.raises(ModifierError):
+    await root.run(
+        ESPAppAddSegmentModifier,
+        ESPAppAddSegmentConfig(
+            virtual_address=0x40090000, size=64
+        ),  # free ESP32 IRAM (load) address
+    )
+    modified = await root.get_data()
+    assert len(modified) == len(padded)  # padding absorbed the new segment; total length unchanged
+    # Surviving partition padding past the rebuilt footer is preserved verbatim (the 0x100-byte tail
+    # is well within the padding left after the new segment was spliced in).
+    assert modified[-0x100:] == b"\xff" * 0x100
+
+    reloaded = await ofrak_context.create_root_resource("reloaded.bin", modified)
+    await reloaded.identify()
+    await reloaded.unpack()
+    sections = list(await (await reloaded.view_as(ESPApp)).get_sections())
+    assert any(s.virtual_address == 0x40090000 and s.size == 64 for s in sections)
+    attributes = await reloaded.analyze(ESPAppAttributes)
+    assert attributes.checksum_valid is True
+    assert attributes.hash_valid is True
+
+
+async def test_esp_app_add_segment_rejects_flash_mapped(ofrak_context: OFRAKContext):
+    """A new flash-mapped (IROM/DROM) segment cannot be added -- the bootloader maps only one segment
+    per such region. The modifier rejects it and points at ESPAppExtendSegmentModifier."""
+    probe = await ofrak_context.create_root_resource("probe.bin", load_esp_asset("esp32_hello.bin"))
+    await probe.identify()
+    await probe.unpack()
+    irom = next(s for s in await (await probe.view_as(ESPApp)).get_sections() if "IROM" in s.name)
+
+    root = await ofrak_context.create_root_resource("add.bin", load_esp_asset("esp32_hello.bin"))
+    await root.identify()
+    with pytest.raises(ModifierError, match="ESPAppExtendSegmentModifier"):
         await root.run(
             ESPAppAddSegmentModifier,
-            ESPAppAddSegmentConfig(virtual_address=0x40090000, size=0x40),
+            ESPAppAddSegmentConfig(virtual_address=irom.virtual_address, size=64),
         )
 
 

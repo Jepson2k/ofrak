@@ -345,6 +345,8 @@ def _arch_info_to_processor_id(processor: ArchInfo):
         InstructionSet.PPC: "PowerPC",
         InstructionSet.M68K: "68000",
         InstructionSet.X86: "x86",
+        InstructionSet.RISCV: "RISCV",
+        InstructionSet.XTENSA: "Xtensa",
     }
     family = families.get(processor.isa)
 

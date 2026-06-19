@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 ## [Unreleased 0.2.0](https://github.com/redballoonsecurity/ofrak/tree/master)
 
 ### Added
+- Map `InstructionSet.RISCV` and `InstructionSet.XTENSA` to their Ghidra processors so RISC-V / Xtensa (e.g. ESP) code regions can be disassembled.
 - Add OFRAK requirements, requirement to test mapping, test specifications ([#656](https://github.com/redballoonsecurity/ofrak/pull/656))
 
 ### Changed

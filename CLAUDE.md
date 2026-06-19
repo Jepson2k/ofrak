@@ -103,7 +103,7 @@ You can obtain appropriate test data by:
 
 ## Contributing
 
-- Update `CHANGELOG.md` and bump the **rc version** in `setup.py` for any package changes
+- Do **not** bump versions (`version.py` / `setup.py`) or edit `CHANGELOG.md` as part of a change — the maintainer finalizes the **rc version** bump and changelog entries right before merge. (If a change renames/removes a symbol an existing changelog entry references, flag the staleness rather than editing the changelog.)
 - Changelogs follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format with PR links
 - Pre-commit hooks must pass (install with `pre-commit install`)
 - Dependencies should be updated in each package's `setup.py` and `requirements.txt` file

@@ -355,3 +355,24 @@ class ESPAppAddSegmentConfig(ComponentConfig):
     virtual_address: int
     size: int
     fill_byte: int = 0x00
+
+
+@dataclass
+class ESPAppExtendSegmentConfig(ComponentConfig):
+    """
+    Configuration for growing an existing loadable segment by appending `size` fill bytes to its
+    end, creating injectable free space contiguous with that segment.
+
+    Use this instead of `ESPAppAddSegmentConfig` for code/data in a flash-memory-mapped region
+    (IROM / DROM): the bootloader maps only one segment per such region, so injected code must join
+    the existing mapped segment rather than form a separate one (which the bootloader would refuse
+    to map). The resulting free space starts at `segment_virtual_address + <old segment size>`.
+
+    :param segment_virtual_address: the load address (start) of the segment to extend
+    :param size: the number of fill bytes to append
+    :param fill_byte: the byte value the appended space is initialized with
+    """
+
+    segment_virtual_address: int
+    size: int
+    fill_byte: int = 0x00

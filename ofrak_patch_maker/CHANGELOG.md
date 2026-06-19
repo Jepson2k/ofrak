@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ### Added
 - Add Espressif Xtensa (`xtensa-esp-elf`) and RISC-V (`riscv32-esp-elf`) GCC toolchains for compiling patches that target ESP firmware.
+- Install Espressif QEMU (`qemu-system-xtensa` / `qemu-system-riscv32`) in the image so injected ESP patches can be booted and verified.
 
 ### Fixed
 - Patchmaker: prevent emission of NEON instructions (aarch64) ([#742](https://github.com/redballoonsecurity/ofrak/pull/742))

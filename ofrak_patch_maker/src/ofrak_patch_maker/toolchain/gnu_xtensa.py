@@ -43,9 +43,12 @@ class GNU_XTENSA_ESP_Toolchain(GNU_10_Toolchain):
         toolchain_config: ToolchainConfig,
         logger: logging.Logger = logging.getLogger(__name__),
     ):
+        # Lazy cache for the resolved esp32 GNU config; populated on first use by
+        # ``_esp32_core_overlay`` at build time (via ``_execute_tool``), not during construction.
+        # Defined up front so the attribute exists for the object's whole lifetime.
+        self._xtensa_gnu_config: Optional[str] = None
         super().__init__(processor, toolchain_config, logger=logger)
         self._compiler_flags.extend(_ESP_XTENSA_COMPILER_FLAGS)
-        self._xtensa_gnu_config: Optional[str] = None
 
     @property
     def name(self) -> str:

@@ -1,9 +1,9 @@
 from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ofrak.component.analyzer import Analyzer
-from ofrak.component.modifier import Modifier
+from ofrak.component.modifier import Modifier, ModifierError
 from ofrak.core.architecture import ProgramAttributes
 from ofrak.core.memory_region import MemoryRegion
 from ofrak.model.component_model import ComponentConfig
@@ -11,6 +11,10 @@ from ofrak.model.component_model import ComponentExternalTool
 from ofrak.model.resource_model import index, ResourceAttributes
 from ofrak.model.viewable_tag_model import AttributesType
 from ofrak.resource import Resource, ResourceFactory
+from ofrak.service.assembler.assembler_service_i import (
+    AssemblerBackend,
+    AssemblerServiceInterface,
+)
 from ofrak.service.assembler.assembler_service_keystone import (
     KeystoneAssemblerService,
     KEYSTONE_INSTALL_WORKS,
@@ -83,6 +87,7 @@ class Instruction(MemoryRegion):
         mnemonic: Optional[str] = None,
         operands: Optional[str] = None,
         mode: Optional[InstructionSetMode] = None,
+        assembler: AssemblerBackend = AssemblerBackend.KEYSTONE,
     ) -> bytes:
         """
         Modify the instruction, changing it to an instruction of equal size.
@@ -90,13 +95,22 @@ class Instruction(MemoryRegion):
         :param mnemonic: the modified instruction mnemonic
         :param operands: the modified instruction operands
         :param mode: the modified instruction's instruction set mode
+        :param assembler: which assembler backend encodes the instruction; defaults to
+            [AssemblerBackend.KEYSTONE][ofrak.service.assembler.assembler_service_i.AssemblerBackend].
+            Pass [AssemblerBackend.GHIDRA][ofrak.service.assembler.assembler_service_i.AssemblerBackend]
+            for ISAs Keystone does not support (e.g. Xtensa, RISC-V), which requires the optional
+            ``ofrak_pyghidra`` backend to be discovered.
 
         :return: the instruction's machine code after modification
         """
+        # ``is not None`` rather than ``or``: an explicitly-passed empty operand string (or mode
+        # NONE, whose value is 0) is falsy and would otherwise silently revert to this instruction's
+        # current value.
         modification_config = InstructionModifierConfig(
-            mnemonic or self.mnemonic,
-            operands or self.operands,
-            mode or self.mode,
+            mnemonic if mnemonic is not None else self.mnemonic,
+            operands if operands is not None else self.operands,
+            mode if mode is not None else self.mode,
+            assembler,
         )
         await self.resource.run(InstructionModifier, modification_config)
         data_after_modification = await self.resource.get_data()
@@ -147,11 +161,15 @@ class InstructionModifierConfig(ComponentConfig):
     :ivar mnemonic: the modified instruction's mnemonic
     :ivar operands: the modified instruction's operands
     :ivar mode: the modified instruction's instruction set mode
+    :ivar assembler: which assembler backend encodes the instruction (a serializable enum, so this
+        config stays plain data); defaults to
+        [AssemblerBackend.KEYSTONE][ofrak.service.assembler.assembler_service_i.AssemblerBackend]
     """
 
     mnemonic: str
     operands: str
     mode: InstructionSetMode
+    assembler: AssemblerBackend = AssemblerBackend.KEYSTONE
 
 
 class InstructionModifier(Modifier[InstructionModifierConfig]):
@@ -165,6 +183,9 @@ class InstructionModifier(Modifier[InstructionModifierConfig]):
     """
 
     targets = (Instruction,)
+    # Declares the default (KEYSTONE) backend's tool. A run that selects AssemblerBackend.GHIDRA
+    # uses the discovered ofrak_pyghidra service instead and does not need keystone, but
+    # external_dependencies is a static class attribute, so it advertises the default's dependency.
     external_dependencies = (KEYSTONE_TOOL,)
 
     def __init__(
@@ -172,13 +193,28 @@ class InstructionModifier(Modifier[InstructionModifierConfig]):
         resource_factory: ResourceFactory,
         data_service: DataServiceInterface,
         resource_service: ResourceServiceInterface,
+        assembler_services: List[AssemblerServiceInterface],
     ):
         super().__init__(
             resource_factory,
             data_service,
             resource_service,
         )
-        self._assembler_service = KeystoneAssemblerService()
+        # Map each discovered assembler service by the backend it advertises, so a run can select one
+        # by the serializable `AssemblerBackend` on its config without ofrak_core importing optional
+        # backends (e.g. ofrak_pyghidra registers its GHIDRA service via discovery). Services without
+        # a `backend` (e.g. a bare interface instance) are ignored. Keystone is seeded directly so the
+        # default backend is always available even if discovery is restricted.
+        self._assemblers: Dict[AssemblerBackend, AssemblerServiceInterface] = {
+            service.backend: service
+            for service in assembler_services
+            if getattr(service, "backend", None) is not None
+        }
+        # Keystone is always discovered (it is a concrete service in ofrak_core), so the dict above
+        # normally already maps it; seed it lazily only as a fallback for a restricted/blacklisted
+        # discovery, without constructing a throwaway service on the common path.
+        if AssemblerBackend.KEYSTONE not in self._assemblers:
+            self._assemblers[AssemblerBackend.KEYSTONE] = KeystoneAssemblerService()
 
     async def modify(self, resource: Resource, config: InstructionModifierConfig):
         """
@@ -194,7 +230,14 @@ class InstructionModifier(Modifier[InstructionModifierConfig]):
 
         modified_assembly = f"{config.mnemonic} {config.operands}"
 
-        asm = await self._assembler_service.assemble(
+        assembler_service = self._assemblers.get(config.assembler)
+        if assembler_service is None:
+            raise ModifierError(
+                f"No assembler service is available for {config.assembler.name}. The "
+                f"{config.assembler.name} backend is provided by an OFRAK package that is not "
+                f"installed or not discovered (e.g. ofrak_pyghidra for GHIDRA)."
+            )
+        asm = await assembler_service.assemble(
             modified_assembly,
             resource_memory_region.virtual_address,
             await resource.analyze(ProgramAttributes),

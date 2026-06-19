@@ -191,3 +191,24 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then ESP_HOST=x86_64-linux-gnu; \
       tar xf "${tc}-${ESP_TOOLCHAIN_VERSION}-${ESP_HOST}.tar.xz" -C /opt/rbs/toolchain && \
       rm -f "${tc}-${ESP_TOOLCHAIN_VERSION}-${ESP_HOST}.tar.xz"; \
     done
+
+# Espressif QEMU (system emulators for the ESP Xtensa + RISC-V targets), pinned to the same release
+# ESP-IDF ships, so the ESP PatchMaker tests can boot a repacked image and observe it run. Each
+# tarball extracts to a `qemu/` dir; we keep them per-arch under /opt/rbs/qemu and symlink the
+# system emulators onto PATH (qemu-system-xtensa, qemu-system-riscv32).
+# The prebuilt binaries are linked against SDL2 (display, unused under -nographic) and slirp (the
+# user-mode "-nic user" network), so those runtime libraries must be present.
+RUN apt-get update && apt-get install -y --no-install-recommends libsdl2-2.0-0 libslirp0 && \
+    rm -rf /var/lib/apt/lists/*
+ARG ESP_QEMU_RELEASE=esp-develop-9.0.0-20240606
+ARG ESP_QEMU_VERSION=esp_develop_9.0.0_20240606
+RUN if [ "$TARGETARCH" = "amd64" ]; then ESP_HOST=x86_64-linux-gnu; \
+    elif [ "$TARGETARCH" = "arm64" ]; then ESP_HOST=aarch64-linux-gnu; fi; \
+    mkdir -p /opt/rbs/qemu && cd /tmp && \
+    for qarch in xtensa riscv32; do \
+      wget "https://github.com/espressif/qemu/releases/download/${ESP_QEMU_RELEASE}/qemu-${qarch}-softmmu-${ESP_QEMU_VERSION}-${ESP_HOST}.tar.xz" --show-progress --progress=bar:force:noscroll && \
+      tar xf "qemu-${qarch}-softmmu-${ESP_QEMU_VERSION}-${ESP_HOST}.tar.xz" -C /opt/rbs/qemu && \
+      mv /opt/rbs/qemu/qemu "/opt/rbs/qemu/${qarch}" && \
+      ln -s "/opt/rbs/qemu/${qarch}/bin/qemu-system-${qarch}" "/usr/local/bin/qemu-system-${qarch}" && \
+      rm -f "qemu-${qarch}-softmmu-${ESP_QEMU_VERSION}-${ESP_HOST}.tar.xz"; \
+    done

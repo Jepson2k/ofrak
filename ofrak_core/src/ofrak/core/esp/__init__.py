@@ -13,6 +13,7 @@ from .app import (
     ESPAppProgramAttributesAnalyzer,
     ESPAppHeaderModifier,
     ESPAppAddSegmentModifier,
+    ESPAppExtendSegmentModifier,
     ESPAppPacker,
 )
 
@@ -23,6 +24,7 @@ from .app_model import (
     ESPAppAttributes,
     ESPAppHeaderModifierConfig,
     ESPAppAddSegmentConfig,
+    ESPAppExtendSegmentConfig,
     ESP_APP_MAGIC,
     ESP8266V2_APP_MAGIC,
     ESP_APP_HEADER_SIZE,
@@ -81,12 +83,14 @@ __all__ = [
     "ESPAppProgramAttributesAnalyzer",
     "ESPAppHeaderModifier",
     "ESPAppAddSegmentModifier",
+    "ESPAppExtendSegmentModifier",
     "ESPAppPacker",
     # App models
     "ESPAppSection",
     "ESPAppAttributes",
     "ESPAppHeaderModifierConfig",
     "ESPAppAddSegmentConfig",
+    "ESPAppExtendSegmentConfig",
     "ESP_APP_MAGIC",
     "ESP8266V2_APP_MAGIC",
     "ESP_APP_HEADER_SIZE",
